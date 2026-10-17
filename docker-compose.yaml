@@ -1,0 +1,11 @@
+services:
+  stepstone-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Recommended — Akamai refuses datacenter IPs, so use a residential proxy.
+      # `{country}` is filled with each board's country (de, at, be, nl, gb, za).
+      # - STEPSTONE_PROXY=http://user:pass@host:port

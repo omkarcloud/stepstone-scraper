@@ -1,0 +1,147 @@
+# 💼 Stepstone Scraper
+
+Stepstone Scraper is a **free and open-source** scraper that gets you **unlimited** detailed Stepstone job data for free.
+
+## ✨ What Can I Get?
+
+- 🔍 **Search 390K+ live jobs on 8 boards** — Stepstone DE, AT, BE, NL, Totaljobs, CWJobs, NIJobs & Pnet, with every site filter
+- 📄 **Full job details** — every section, salary range, contract type, exact location & employer rating
+- 🏢 **Employer profiles** — BMW Group, Mercedes-Benz & co: address, size, about text, photos, videos & open jobs
+- 📊 **Live filter counts & autocomplete** — skills, fields, cities, salary floors and Stepstone's own search suggestions
+
+## 🎥 Example: A Full Stepstone Job
+
+```json
+{
+  "id": 14448261,
+  "title": "(Junior) Data Scientist (m/w/d) – Generative AI Mietwagen International",
+  "link": "https://www.stepstone.de/stellenangebote--Junior-Data-Scientist-m-w-d-Generative-AI-Mietwagen-International-Muenchen-CHECK24--14448261-inline.html",
+  "posted_at": "2026-10-01T15:03:12Z",
+  "expires_at": "2027-08-27T15:01:51Z",
+  "employment_type": "FULL_TIME",
+  "industry": "Wissenschaften, Wissenschaften-Data Science",
+  "location": { "city": "München", "postcode": "80339", "country": "DE", "latitude": 48.1388, "longitude": 11.5341 },
+  "salary": { "min": 54000, "max": 80000, "currency": "EUR", "period": "year", "is_predicted": true },
+  "sections": [
+    { "name": "description", "title": "Zu Deinen Aufgaben zählen", "text": "- Im Team arbeiten: Du bist vom ersten Tag an Teil unseres AI-Teams..." }
+  ],
+  "company": {
+    "id": 112642,
+    "name": "CHECK24",
+    "rating": { "average": 4.55, "count": 241 },
+    "employees": "1000+",
+    "address": "Erika-Mann-Str. 66, München"
+  },
+  "similar_jobs": [
+    { "id": 14580525, "title": "Data Scientist - Digital Analytics (w|m|d)", "company": { "name": "ADAC" } }
+  ]
+}
+```
+
+*Trimmed for readability.*
+
+## 🚀 Unlimited Free Stepstone Data — Get It in 60 Seconds
+
+1️⃣ Clone and install:
+```bash
+git clone https://github.com/omkarcloud/stepstone-scraper
+cd stepstone-scraper
+python -m pip install -r requirements.txt
+```
+
+2️⃣ Start the API:
+```bash
+python run.py
+```
+
+Stepstone sits behind Akamai, which turns away datacenter IPs. If your calls come back as "blocked the request", point the scraper at a residential proxy and start it again:
+```bash
+export STEPSTONE_PROXY="http://user:pass@host:port"
+python run.py
+```
+
+3️⃣ Get your first data:
+```bash
+curl "http://localhost:8000/jobs/details?job=14448261"
+```
+
+```json
+{
+  "id": 14448261,
+  "title": "(Junior) Data Scientist (m/w/d) – Generative AI Mietwagen International",
+  "link": "https://www.stepstone.de/stellenangebote--Junior-Data-Scientist-m-w-d-Generative-AI-Mietwagen-International-Muenchen-CHECK24--14448261-inline.html",
+  "posted_at": "2026-10-01T15:03:12Z",
+  "contract_type": "Feste Anstellung",
+  "location": { "city": "München", "postcode": "80339", "country": "DE", "latitude": 48.1388, "longitude": 11.5341 },
+  "salary": { "min": 54000, "max": 80000, "currency": "EUR", "period": "year", "is_predicted": true },
+  "company": {
+    "id": 112642,
+    "name": "CHECK24",
+    "rating": { "average": 4.55, "count": 241 },
+    "employees": "1000+"
+  },
+  "is_direct_apply": true
+}
+```
+
+All 9 endpoints are now live at `http://localhost:8000`.
+
+## 📚 Endpoints
+
+9 endpoints cover everything you need.
+
+| Endpoint | Path | Returns |
+|---|---|---|
+| Job Details | `/jobs/details` | Every section, salary, exact location, employer rating and similar jobs |
+| Search Jobs | `/jobs/search` | 25 jobs per page across 8 boards, with every site filter |
+| Jobs by IDs | `/jobs/batch` | Up to 10 full job ads in one call |
+| Company Details | `/companies/details` | Employer profile, address, size, media and where its jobs are |
+| Company Jobs | `/companies/jobs` | Every open job at one employer, filterable, 25 per page |
+| Search Filters | `/jobs/filters` | Every filter option with live job counts for your search |
+| Jobs by Search Link | `/jobs/by-link` | The jobs behind any Stepstone search or company page URL |
+| Autocomplete | `/autocomplete` | Stepstone's own job-title suggestions with live job counts |
+| Supported Sites | `/sites` | The 8 boards with country, language and currency |
+
+## 🔍 Exploring Parameters
+
+The same API is published on RapidAPI, and its playground is the easiest place to try parameters and see raw responses. Once a request looks right, run it locally for **unlimited free** data.
+
+1. [Subscribe to the free plan](https://rapidapi.com/OmkarCloud/api/best-stepstone-scraper-free-1000-calls/pricing) — 1,000 calls/month, no credit card.
+2. [Try the endpoints in the playground](https://rapidapi.com/OmkarCloud/api/best-stepstone-scraper-free-1000-calls/playground) — every param is pre-filled, so you see real data in one click.
+3. Copy the generated code and replace `https://best-stepstone-scraper-free-1000-calls.p.rapidapi.com` with `http://localhost:8000`. It will now run against your local API.
+
+```python
+import requests
+
+# generated by the playground, host swapped for the local API
+response = requests.get(
+    "http://localhost:8000/jobs/search",
+    params={"keyword": "software engineer", "location": "Berlin", "posted_within": "7_days", "remote": "partial"},
+)
+print(response.json())
+```
+
+## 💬 Have Questions? We Have Answers.
+
+You're a developer — we know how hard completing a project can be. So we offer full support: just message us and we'll reply ✅ with a solution within 1 working day.
+
+[![Message Us on WhatsApp about Stepstone Scraper](https://raw.githubusercontent.com/omkarcloud/assets/master/images/whatsapp-us.png)](https://api.whatsapp.com/send?phone=918178804274&text=I%20need%20help%20using%20the%20Stepstone%20Scraper%20API.)
+
+[![Ask Us by Email about Stepstone Scraper](https://raw.githubusercontent.com/omkarcloud/assets/master/images/ask-on-email.png)](mailto:happy.to.help@omkar.cloud?subject=Help%20with%20Stepstone%20Scraper%20API&body=I%20need%20help%20using%20the%20Stepstone%20Scraper%20API.)
+
+## ⚡ Popular Scrapers by Omkar Cloud
+
+- [**Google Maps Scraper (3,100+ GitHub Stars)**](https://github.com/omkarcloud/google-maps-scraper) — type "dentists in New York", get every business as a ready-to-call lead list: phones, emails, websites & reviews. Up to 100K free leads/month.
+- [**Glassdoor Scraper**](https://github.com/omkarcloud/glassdoor-scraper) — Glassdoor jobs, company ratings, salaries & reviews
+- [**Upwork Scraper**](https://github.com/omkarcloud/upwork-scraper) — Upwork jobs, clients, freelancers & agencies
+- [**G2 Scraper**](https://www.omkar.cloud/tools/g2-scraper) — G2 product details, ratings & AI-found contacts
+- [**Website Email Contact Scraper**](https://www.omkar.cloud/tools/website-email-contact-scraper) — emails, phones & socials from any website
+- [**Booking Scraper**](https://www.omkar.cloud/tools/booking-scraper) — Booking.com hotels: prices, ratings, rooms & amenities
+
+## ⭐ Love It? [Star It ⭐!](https://github.com/omkarcloud/stepstone-scraper)
+
+Star the repo ⭐ and become my star hero!
+
+It's just 1 click, but it means the world to me.
+
+[![Star us on GitHub](https://raw.githubusercontent.com/omkarcloud/google-maps-scraper/master/screenshots/star-us.png)](https://github.com/omkarcloud/stepstone-scraper)
