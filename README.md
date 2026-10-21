@@ -132,6 +132,7 @@ You're a developer — we know how hard completing a project can be. So we offer
 ## ⚡ Popular Scrapers by Omkar Cloud
 
 - [**Google Maps Scraper (3,100+ GitHub Stars)**](https://github.com/omkarcloud/google-maps-scraper) — type "dentists in New York", get every business as a ready-to-call lead list: phones, emails, websites & reviews. Up to 100K free leads/month.
+- [**Xing Scraper**](https://github.com/omkarcloud/xing-scraper) — XING jobs, salaries, company pages & employees across Germany, Austria & Switzerland
 - [**Glassdoor Scraper**](https://github.com/omkarcloud/glassdoor-scraper) — Glassdoor jobs, company ratings, salaries & reviews
 - [**Upwork Scraper**](https://github.com/omkarcloud/upwork-scraper) — Upwork jobs, clients, freelancers & agencies
 - [**We Work Remotely Scraper**](https://github.com/omkarcloud/we-work-remotely-scraper) — remote jobs with salary ranges, skills, countries & company profiles
