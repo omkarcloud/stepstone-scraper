@@ -25,7 +25,7 @@ variants, fingerprintCount / jobPostingSequence / cvToJobScore /
 travelTime (always null for anonymous visitors), the Google Maps API key and
 the commute-time service config.
 """
-import json
+import fastjson
 import re
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -53,7 +53,7 @@ WORK_TYPE_VALUES = {"80001": "full_time", "80002": "part_time"}
 APPLICATION_VALUES = {"INTERNAL": "quick_apply", "EXTERNAL": "company_website"}
 SECTION_NAMES = {"main": "direct", "semantic": "related", "regional": "nearby", "family": "related_company",
                  "recommended": "recommended"}
-PERIODS = {"annually": "year", "yearly": "year", "jahr": "year", "jaar": "year", "annum": "year", "year": "year",
+PERIODS = {"annually": "year", "annual": "year", "yearly": "year", "jahr": "year", "jaar": "year", "annum": "year", "year": "year",
            "monthly": "month", "monat": "month", "maand": "month", "month": "month",
            "weekly": "week", "woche": "week", "week": "week",
            "daily": "day", "tag": "day", "dag": "day", "day": "day",
@@ -98,7 +98,7 @@ def _load(raw):
     if not raw:
         return None
     try:
-        return json.loads(_UNDEFINED_RE.sub(":null", raw))
+        return fastjson.loads(_UNDEFINED_RE.sub(":null", raw))
     except ValueError:
         return None
 
@@ -128,7 +128,7 @@ def json_ld(html, type_name):
     """The first JSON-LD block of `type_name` ("JobPosting") in the page."""
     for block in _LD_RE.findall(html or ""):
         try:
-            data = json.loads(block)
+            data = fastjson.loads(block)
         except ValueError:
             continue
         for item in data if isinstance(data, list) else [data]:

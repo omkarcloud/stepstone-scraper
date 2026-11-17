@@ -13,6 +13,7 @@ from stepstone import parsers as P
 from stepstone import refs
 from stepstone import sites as S
 from stepstone.jobs import filter_params
+from scraper_utils.testing import hosted_only
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -261,3 +262,212 @@ def test_paths():
     assert S.company_path(de, 46710) == "/jobs?cmpId=46710&cmp=1"
     assert S.company_path(de, 46710, "ratbacher-gmbh") == "/cmp/de/ratbacher-gmbh-46710/jobs"
     assert S.company_path(S.site("totaljobs"), 1231308, "anson-mccade") == "/jobs/anson-mccade?cmpId=1231308&cmp=1"
+
+
+class _FakeBox:
+    """browser_client.fetch_any stand-in: records every candidate list and
+    answers from the candidate `picks` names, raising BoxRefused on the
+    picks given as ("refuse", i)."""
+    def __init__(self, picks):
+        self.picks, self.offered, self.sessions, self.calls = list(picks), [], [], []
+
+    def __call__(self, site, candidates, **kw):
+        import browser_client
+        self.calls.append(site)
+        self.offered.append([p for p, _s in candidates])
+        self.sessions.append([s for _p, s in candidates])
+        pick = self.picks.pop(0)
+        if isinstance(pick, tuple):
+            raise browser_client.BoxRefused("refused", candidate=pick[1])
+        return pick, {"status": 200, "body": f"from-browser-{pick}", "final_url": kw.get("url")}
+
+
+@hosted_only
+def test_box_pool_mints_each_countrys_own_exits_under_concurrency(monkeypatch):
+    """Until 2026-11-04 _CountryExits rebound self._mint per call outside
+    the lock, so two countries minting at once could swap exits."""
+    import threading
+    import config
+    from stepstone import fetch
+    counter = iter(range(1, 10_000))
+    monkeypatch.setattr(config, "stepstone_proxy", lambda country: f"http://{country}:{next(counter)}")
+    monkeypatch.setattr(config, "STEPSTONE_BROWSER_SLOTS", 3)
+    monkeypatch.setattr(config, "BROWSER_BURST_FACTOR", 4)
+    fetch._EXITS.reset()
+    countries = ["de", "fr", "gb", "at", "nl", "be", "za", "ch"] * 4
+    start = threading.Barrier(len(countries))
+    got = {}
+
+    def run(cc):
+        start.wait()
+        got[(cc, threading.get_ident())] = fetch._EXITS.all(cc)
+    threads = [threading.Thread(target=run, args=(cc,)) for cc in countries]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    for (cc, _tid), exits in got.items():
+        assert len(exits) == 12 and all(p.startswith(f"http://{cc}:") for p in exits), (cc, exits)
+        assert exits == fetch._EXITS.current(cc)                                      # sticky per country
+
+
+@hosted_only
+def test_box_page_rotates_only_the_used_exit(monkeypatch):
+    import config
+    import browser_client
+    from stepstone import fetch
+    counter = iter(range(1, 10_000))
+    monkeypatch.setattr(config, "stepstone_proxy", lambda country: f"http://{country}:{next(counter)}")
+    monkeypatch.setattr(config, "STEPSTONE_BROWSER_SLOTS", 3)
+    monkeypatch.setattr(config, "BROWSER_BURST_FACTOR", 4)
+    box = _FakeBox([0, 2, ("refuse", 2)])
+    monkeypatch.setattr(browser_client, "fetch_any", box)
+    monkeypatch.setattr(fetch, "classify", lambda status, body, label, final_url: body)
+    fetch._EXITS.reset()
+    url = "https://www.stepstone.de/jobs/python"
+    assert fetch._box_page("de", url, "t").endswith("-0")
+    assert fetch._box_page("de", url, "t").endswith("-2")
+    first = box.offered[0]
+    assert len(first) == 12 and box.offered[1] == first
+    with pytest.raises(fetch.StepstoneBlocked):
+        fetch._box_page("de", url, "t")
+    after = fetch._EXITS.current("de")
+    assert after[2] != first[2] and after[:2] == first[:2] and after[3:] == first[3:]
+
+
+# ---- the gateway exit in front of the residential exits (fetch._with_sessions) ----------------
+
+class _FakeJar:
+    def __init__(self):
+        self.cleared = 0
+
+    def clear(self):
+        self.cleared += 1
+
+
+class _FakeCurl:
+    """egress.new_session stand-in: remembers the exit it was built for."""
+    def __init__(self, exit):
+        self.exit, self.cookies, self.closed = exit, _FakeJar(), False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def gateway(monkeypatch):
+    """The gateway knobs on (de -> gateway:de with the job / ?cmpId= pages
+    skipped, gb -> gateway:gb), fake sessions, no sleeps, empty pools."""
+    import config
+    from stepstone import fetch
+    built = []
+
+    def new_session(exit, impersonate="chrome"):
+        built.append(exit)
+        return _FakeCurl(exit)
+    monkeypatch.setattr(fetch.egress, "new_session", new_session)
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(config, "stepstone_proxy", lambda country: f"http://{country}:resi")
+    monkeypatch.setattr(config, "STEPSTONE_USE_PROXY", True)
+    monkeypatch.setattr(config, "STEPSTONE_EXIT", "gateway")
+    monkeypatch.setattr(config, "STEPSTONE_GATEWAY_EXITS", {"de": "gateway:de", "at": "gateway:de", "gb": "gateway:gb", "ch": "gateway:zz"})
+    monkeypatch.setattr(config, "STEPSTONE_GATEWAY_SKIP", {"gateway:de": ("-inline.html", "cmpId=")})
+    monkeypatch.setattr(config, "STEPSTONE_GATEWAY_ATTEMPTS", 1)
+    monkeypatch.setattr(config, "STEPSTONE_GATEWAY_FAILURES", 2)
+    monkeypatch.setattr(config, "STEPSTONE_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(config, "STEPSTONE_BROWSER_FALLBACK", True)
+    fetch.reset_sessions()
+    fetch._gateway_failures.clear()
+    fetch._gateway_paused.clear()
+    yield built
+    fetch.reset_sessions()
+    fetch._gateway_failures.clear()
+    fetch._gateway_paused.clear()
+
+
+SEARCH_DE = "https://www.stepstone.de/jobs/python/in-berlin?radius=30"
+JOB_DE = "https://www.stepstone.de/stellenangebote--x--13818030-inline.html"
+
+
+@hosted_only
+def test_gateway_is_picked_per_board_country_and_page(gateway, monkeypatch):
+    import config
+    from stepstone import fetch
+    assert fetch._gateway_for("de", SEARCH_DE) == "gateway:de"
+    assert fetch._gateway_for("at", "https://www.stepstone.at/jobs/in-wien") == "gateway:de"         # no gateway in AT: Frankfurt
+    assert fetch._gateway_for("gb", "https://www.totaljobs.com/job/x/x-job108167578") == "gateway:gb"
+    assert fetch._gateway_for("gb", "https://www.totaljobs.com/jobs?cmpId=1231308&cmp=1") == "gateway:gb"
+    # the job and ?cmpId= pages of the boards on the Frankfurt gateway stay residential
+    assert fetch._gateway_for("de", JOB_DE) is None
+    assert fetch._gateway_for("de", "https://www.stepstone.de/jobs?cmpId=46710&cmp=1") is None
+    assert fetch._gateway_for("at", "https://www.stepstone.at/stellenangebote--x--1012153-inline.html") is None
+    assert fetch._gateway_for("fr", SEARCH_DE) is None          # a country without a row
+    assert fetch._gateway_for("ch", SEARCH_DE) is None          # a row naming a gateway that does not exist
+    monkeypatch.setattr(config, "STEPSTONE_EXIT", None)
+    assert fetch._gateway_for("de", SEARCH_DE) is None
+    monkeypatch.setattr(config, "STEPSTONE_EXIT", "gateway")
+    monkeypatch.setattr(config, "STEPSTONE_USE_PROXY", False)   # dev on a residential line: direct, no gateway
+    assert fetch._gateway_for("de", SEARCH_DE) is None
+
+
+@hosted_only
+def test_gateway_first_then_the_residential_attempts(gateway):
+    from stepstone import fetch
+    seen = []
+
+    def call(session):
+        seen.append((session.gateway, session.sess.exit))
+        if session.gateway:
+            raise fetch.StepstoneUpstreamError("gateway 504")
+        return "page"
+    assert fetch._with_sessions("de", call, None, "t", gateway="gateway:de") == "page"
+    assert seen == [("gateway:de", "gateway:de"), (None, "http://de:resi")]
+    # without a gateway (a skipped page, a paused country): the residential loop as before
+    seen.clear()
+    assert fetch._with_sessions("de", call, None, "t") == "page"
+    assert seen == [(None, "http://de:resi")] and gateway == ["gateway:de", "http://de:resi"]     # the pooled residential session
+
+
+@hosted_only
+def test_gateway_session_is_pooled_without_its_cookies(gateway):
+    from stepstone import fetch
+    sessions = []
+    for _ in range(3):
+        fetch._with_sessions("gb", lambda s: sessions.append(s) or "ok", None, "t", gateway="gateway:gb")
+    assert gateway == ["gateway:gb"] and sessions[0] is sessions[1] is sessions[2]
+    assert sessions[0].sess.cookies.cleared == 3 and not sessions[0].sess.closed
+    # a residential session keeps its jar: one sticky exit is one visitor
+    resi = []
+    fetch._with_sessions("gb", lambda s: resi.append(s) or "ok", None, "t")
+    assert resi[0].gateway is None and resi[0].sess.cookies.cleared == 0
+
+
+@hosted_only
+def test_gateway_failures_pause_the_board_country(gateway):
+    from stepstone import fetch
+
+    def call(session):
+        if session.gateway:
+            raise fetch.StepstoneBlocked("access denied", status=403)
+        return "page"
+    for _ in range(2):          # config.STEPSTONE_GATEWAY_FAILURES
+        assert fetch._with_sessions("de", call, None, "t", gateway=fetch._gateway_for("de", SEARCH_DE)) == "page"
+    assert fetch._gateway_for("de", SEARCH_DE) is None          # paused: residential only
+    assert fetch._gateway_for("gb", "https://www.totaljobs.com/jobs/nurse") == "gateway:gb"     # per country
+    fetch._gateway_paused["de"] = 0.0                           # the pause ran out
+    assert fetch._gateway_for("de", SEARCH_DE) == "gateway:de"
+
+
+@hosted_only
+def test_browser_fallback_is_decided_by_the_residential_attempts(gateway):
+    from stepstone import fetch
+
+    def call(session):
+        if session.gateway:
+            raise fetch.StepstoneUpstreamError("gateway 504")       # not a refusal
+        raise fetch.StepstoneBlocked("access denied", status=403)
+    assert fetch._with_sessions("de", call, lambda: "from-browser", "t", gateway="gateway:de") == "from-browser"
+    assert gateway == ["gateway:de", "http://de:resi", "http://de:resi"]    # 1 gateway try + STEPSTONE_MAX_ATTEMPTS
+
+    def transport(session):
+        raise fetch.StepstoneUpstreamError("timeout")
+    with pytest.raises(fetch.StepstoneUpstreamError):                   # a residential transport error: no browser, as before
+        fetch._with_sessions("de", transport, lambda: "from-browser", "t", gateway="gateway:de")

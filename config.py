@@ -43,3 +43,20 @@ def stepstone_proxy(country=None):
     if proxy and country:
         proxy = proxy.replace("{country}", country)
     return proxy
+
+
+# ---- added by the sync: defaults for a direct run ----
+STEPSTONE_BROWSER_SLOTS = 1
+STEPSTONE_GATEWAY_ATTEMPTS = 1
+STEPSTONE_GATEWAY_FAILURES = 4
+STEPSTONE_GATEWAY_PAUSE = 600
+STEPSTONE_GATEWAY_SKIP = {}
+STEPSTONE_GATEWAY_TIMEOUT = 12
+STEPSTONE_GATEWAY_WINDOW = 120
+def burst_slots(share):
+    return share
+
+
+def stepstone_gateway(country=None):
+    return None
+

@@ -11,9 +11,22 @@ leaves through config.stepstone_proxy(<country>) — a fresh sticky exit per
 session, sessions pooled per country and retired after
 config.STEPSTONE_REQUESTS_PER_SESSION calls. A blocked call is retried on a
 fresh exit up to config.STEPSTONE_MAX_ATTEMPTS times; when every attempt was
-refused one headful patchright Chrome on the same kind of exit loads the page
-(config.STEPSTONE_BROWSER_FALLBACK) and stays open for
-config.STEPSTONE_BROWSER_IDLE_SECONDS.
+refused a headed Chrome on the browser box, on the same kind of exit, loads
+the page (config.STEPSTONE_BROWSER_FALLBACK; recipes/stepstone.py).
+
+Since 2026-11-11 a call tries the gateway exit of the board's country first
+(config.STEPSTONE_GATEWAY_EXITS: "gateway:de" for stepstone.de and, having no
+gateway of their own, .at / .be / .nl / pnet; "gateway:gb" for the UK boards),
+once, then the residential attempts above unchanged. The boards take the
+client from X-Forwarded-For, which the gateway sets to a home address of
+its country, so Akamai answers as it does a residential exit. Three things
+differ on a gateway session (_gateway_for, _timeout, _checkin): the job and
+?cmpId= pages of the boards on "gateway:de" never ride it (stepstone.de / .at /
+.be hold the request open for a quarter of the German X-Forwarded-For
+addresses; config.STEPSTONE_GATEWAY_SKIP), a try gets a short read timeout,
+and the cookie jar is dropped after every call (each request leaves from
+another address). Failures pause the gateway per board country
+(_note_gateway_failure). Evidence in the config block.
 
 Surfaces:
   page(site, path, params)      GET a board page -> Response(text, url, status)
@@ -30,6 +43,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
 Smoke test:  python stepstone/fetch.py [keyword] [site]
 """
 import json
+import fastjson
 import os
 import re
 import sys
@@ -41,9 +55,12 @@ from urllib.parse import urlencode, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import browser_client
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from stepstone import sites as S
+from scraper_utils import debug, memo
 
 TIMEOUT = (10, 90)          # (connect, read) — result pages are 1-1.4 MB of HTML
 
@@ -58,7 +75,6 @@ BLOCK_STATUSES = (401, 403, 429, 503)
 DENIED_MARKERS = ("<TITLE>Access Denied</TITLE>", "errors.edgesuite.net", "<title>Error - Access denied</title>")
 NOT_FOUND_MARKERS = ("<title>Error - Page not found</title>",)
 STATE_MARKER = "window.__PRELOADED_STATE__"
-BROWSER_SETTLE_TIMEOUT = 45
 RATE_LIMIT_BACKOFF = 2.0
 _SITE_ID_RE = re.compile(r'"siteId":\s*(\d+)')
 
@@ -94,14 +110,7 @@ class Response:
 
 def dump_debug(name, text):
     """Write a raw response to $STEPSTONE_DEBUG_DIR/<name>.txt."""
-    dbg = os.environ.get("STEPSTONE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text if isinstance(text, str) else json.dumps(text))
-        except OSError:
-            pass
+    debug.dump("STEPSTONE_DEBUG_DIR", name, text, render=json.dumps)
 
 
 # ---- sessions (pooled per proxy country) ---------------------------------------------------
@@ -109,12 +118,13 @@ def dump_debug(name, text):
 # duration of one call and returned afterwards.
 
 class _Session:
-    __slots__ = ("sess", "used", "proxy", "country", "impersonate", "last_headers")
+    __slots__ = ("sess", "used", "proxy", "country", "gateway", "impersonate", "last_headers")
 
-    def __init__(self, sess, proxy, country, impersonate):
+    def __init__(self, sess, proxy, country, impersonate, gateway=None):
         self.sess = sess
         self.proxy = proxy
         self.country = country
+        self.gateway = gateway          # "gateway" / "gateway:<cc>" when `sess` is an exit_gateway.Session, else None
         self.impersonate = impersonate
         self.used = 0
         self.last_headers = PAGE_HEADERS
@@ -126,7 +136,7 @@ class _Session:
             pass
 
 
-_idle = {}                  # country -> [sessions]
+_idle = {}                  # (country, gateway exit or None) -> [sessions]
 _idle_lock = threading.Lock()
 _fresh_count = 0
 
@@ -135,29 +145,26 @@ def _budget():
     return max(1, int(config.STEPSTONE_REQUESTS_PER_SESSION))
 
 
-def _new_session(country):
+def _new_session(country, gateway=None):
     """A new curl session: next TLS identity in rotation, on a fresh sticky
-    exit of `country`, with an empty cookie jar."""
+    exit of `country`, with an empty cookie jar. `gateway` ("gateway:de") = an
+    exit_gateway.Session on that gateway exit instead (egress.new_session)."""
     global _fresh_count
-    from curl_cffi import requests as curl_requests
     identities = tuple(config.STEPSTONE_IMPERSONATIONS) or ("chrome",)
     with _idle_lock:
         impersonate = identities[_fresh_count % len(identities)]
         _fresh_count += 1
-    proxy = config.stepstone_proxy(country)
-    sess = curl_requests.Session(impersonate=impersonate)
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
-    return _Session(sess, proxy, country, impersonate)
+    proxy = gateway or config.stepstone_proxy(country)
+    return _Session(egress.new_session(proxy, impersonate=impersonate), proxy, country, impersonate, gateway)
 
 
-def _checkout(country, fresh=False):
+def _checkout(country, fresh=False, gateway=None):
     if not fresh:
         with _idle_lock:
-            pool = _idle.get(country) or []
+            pool = _idle.get((country, gateway)) or []
             if pool:
                 return pool.pop()
-    return _new_session(country)
+    return _new_session(country, gateway)
 
 
 def _checkin(session):
@@ -165,8 +172,16 @@ def _checkin(session):
     if session.used >= _budget():
         session.close()
         return
+    if session.gateway:
+        # Every gateway request leaves from another gateway address and announces
+        # another X-Forwarded-For, so the Akamai cookies one call collected
+        # (_abck, bm_sz, ak_bmsc) are not replayed by the next: a pooled
+        # gateway session keeps its connection, never its jar. 2026-11-11:
+        # with the jar kept 2 of 21 UK requests failed (a job page held open
+        # on a session's 7th use, a 403 on its 12th); cookie-less ones did not.
+        session.sess.cookies.clear()
     with _idle_lock:
-        _idle.setdefault(session.country, []).append(session)
+        _idle.setdefault((session.country, session.gateway), []).append(session)
 
 
 def reset_sessions():
@@ -197,93 +212,37 @@ def classify(status, text, label, final_url=None):
     return Response(text, final_url, status)
 
 
-# ---- browser fallback -----------------------------------------------------------------------
+# ---- browser fallback (on the browser box) --------------------------------------------------
 
-class _Browser:
-    """One headful patchright Chrome on a residential exit of the board's
-    country, opened on demand, reused while busy and closed after
-    config.STEPSTONE_BROWSER_IDLE_SECONDS unused. A request for another
-    country replaces it."""
+# Sticky residential exits per board country for the box's Chromes
+# (recipes/stepstone.py navigates until a real board page is up). A refusal
+# burns that country's exit: the box closes the browser, the next fallback
+# call starts on a fresh one. Chrome left GKE 2026-10-22.
+# STEPSTONE_BROWSER_SLOTS browsers per country are the share; the pool
+# offers share x BROWSER_BURST_FACTOR candidates and the box picks an idle
+# one or opens another while it has headroom (2026-11-04).
+class _CountryExits(browser_client.ExitPool):
+    """One sticky-exit family per board country (the pool key): the mint
+    needs the country. Until 2026-11-04 get()/rotate() rebound self._mint
+    per call OUTSIDE the lock, so two countries minting at once could hand
+    one country the other's exit; _mint_for(key) is the hook for this."""
 
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.driver = None
-        self.country = None
-        self.last_used = 0.0
-        self.closer = None
-
-    def _open(self, country):
-        from chrome_manager import create_scope
-        from patchright_driver import PatchrightDriver
-        with create_scope():
-            driver = PatchrightDriver(proxy_url=config.stepstone_proxy(country), headless=False, geoip_timezone=True)
-        return driver
-
-    @staticmethod
-    def _nav(driver, url):
-        """Navigate and wait for a real StepStone page (one carrying the preloaded state)."""
-        result = driver.nav(url, referer="https://www.google.com/", mode="blocked")
-        html = (result or {}).get("html") or ""
-        status = (result or {}).get("status") or 200
-        deadline = time.monotonic() + BROWSER_SETTLE_TIMEOUT
-        while STATE_MARKER not in html:
-            if any(m in html[:30000] for m in NOT_FOUND_MARKERS) or status in (404, 410):
-                break
-            if time.monotonic() > deadline:
-                raise StepstoneBlocked("browser never reached a StepStone page")
-            time.sleep(1.5)
-            try:
-                html = driver.content() or ""
-            except Exception:
-                html = ""
-        return html, status, (result or {}).get("url") or url
-
-    def _close_if_idle(self):
-        while True:
-            time.sleep(30)
-            with self.lock:
-                if self.driver is None:
-                    self.closer = None
-                    return
-                if time.time() - self.last_used > config.STEPSTONE_BROWSER_IDLE_SECONDS:
-                    self._drop()
-                    self.closer = None
-                    return
-
-    def _drop(self):
-        if self.driver is not None:
-            try:
-                self.driver.close()
-            except Exception:
-                pass
-        self.driver = None
-        self.country = None
-
-    def _ensure(self, country):
-        if self.driver is not None and self.country != country:
-            self._drop()
-        if self.driver is None:
-            self.driver = self._open(country)
-            self.country = country
-        if self.closer is None:
-            self.closer = threading.Thread(target=self._close_if_idle, daemon=True)
-            self.closer.start()
-        self.last_used = time.time()
-
-    def page(self, country, url, label):
-        with self.lock:
-            self._ensure(country)
-            try:
-                html, status, final_url = self._nav(self.driver, url)
-            except StepstoneNotFound:
-                raise
-            except Exception:
-                self._drop()
-                raise
-        return classify(status, html, label, final_url)
+    def _mint_for(self, key):
+        return config.stepstone_proxy(key)
 
 
-_browser = _Browser()
+_EXITS = _CountryExits("stepstone", lambda: None, size=lambda: config.STEPSTONE_BROWSER_SLOTS, burst=True)
+
+
+def _box_page(country, url, label):
+    try:
+        _proxy, res = _EXITS.fetch_any("stepstone", country, url=url)
+    except browser_client.BoxRefused as e:
+        _EXITS.rotate(e.proxy, key=country)      # only the exit the box was using
+        raise StepstoneBlocked(f"{label}: refused in the box browser: {e}") from e
+    except browser_client.BoxUnavailable as e:
+        raise StepstoneUpstreamError(f"{label}: browser box unavailable: {e}") from e
+    return classify(int(res.get("status") or 200), res.get("body") or "", label, res.get("final_url") or url)
 
 
 # ---- requests -------------------------------------------------------------------------------------
@@ -319,8 +278,8 @@ def _solve_interstitial(session, url, text, label):
     try:
         verify = session.sess.post(origin + _INTERSTITIAL_MARKER, headers={
             "accept": "*/*", "content-type": "application/json", "origin": origin, "referer": url},
-            data=json.dumps({"bm-verify": token_match.group(1), "pow": answer}), timeout=TIMEOUT)
-        resp = session.sess.get(url, headers=session.last_headers, timeout=TIMEOUT, allow_redirects=True)
+            data=json.dumps({"bm-verify": token_match.group(1), "pow": answer}), timeout=_timeout(session))
+        resp = session.sess.get(url, headers=session.last_headers, timeout=_timeout(session), allow_redirects=True)
     except Exception as e:
         raise StepstoneUpstreamError(f"interstitial verify failed on {label}: {type(e).__name__}: {e}")
     if _INTERSTITIAL_MARKER in resp.text[:5000]:
@@ -333,7 +292,7 @@ def _solve_interstitial(session, url, text, label):
 def _curl_get(session, url, headers, label):
     session.last_headers = headers
     try:
-        resp = session.sess.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        resp = session.sess.get(url, headers=headers, timeout=_timeout(session), allow_redirects=True)
         if resp.status_code == 200 and len(resp.text) < 10000 and _INTERSTITIAL_MARKER in resp.text:
             resp = _solve_interstitial(session, str(resp.url), resp.text, label)
     except (StepstoneBlocked, StepstoneUpstreamError):
@@ -343,17 +302,71 @@ def _curl_get(session, url, headers, label):
     return classify(resp.status_code, resp.text, label, str(resp.url))
 
 
-def _with_sessions(country, curl_call, browser_call, label):
+# ---- the gateway exit in front of the residential exits ---------------------------------------
+# A board country listed in config.STEPSTONE_GATEWAY_EXITS tries its gateway exit
+# first (config.stepstone_gateway; evidence in the config block): a call
+# makes config.STEPSTONE_GATEWAY_ATTEMPTS tries there, then the residential
+# attempts exactly as before, so a gateway problem costs one failed try, not
+# an outage. config.STEPSTONE_GATEWAY_FAILURES failures of one country within
+# config.STEPSTONE_GATEWAY_WINDOW seconds send its calls straight to the
+# residential exits for config.STEPSTONE_GATEWAY_PAUSE seconds; then the
+# gateway is tried again.
+_gateway_lock = threading.Lock()
+_gateway_failures = {}      # board country -> time.monotonic() of its latest failures on the gateway
+_gateway_paused = {}        # board country -> time.monotonic() until which its calls skip the gateway
+
+
+def _gateway_for(country, url):
+    """The gateway exit a call for `url` on a board of `country` tries first,
+    or None: no gateway configured for the country, paused after failures,
+    or a page that gateway cannot serve (config.STEPSTONE_GATEWAY_SKIP: the
+    job and ?cmpId= pages of the stepstone.* boards hang for a quarter of
+    the Frankfurt gateway's X-Forwarded-For addresses)."""
+    gateway = config.stepstone_gateway(country)
+    if not gateway or time.monotonic() < _gateway_paused.get(country, 0.0):
+        return None
+    if any(part in url for part in config.STEPSTONE_GATEWAY_SKIP.get(gateway, ())):
+        return None
+    return gateway
+
+
+def _timeout(session):
+    """(connect, read) of one request: a gateway try gets a short read
+    timeout — pages answer there in 0.7-3.5 s, and a request the site holds
+    open would otherwise cost the gateway's full 29 s."""
+    return (TIMEOUT[0], config.STEPSTONE_GATEWAY_TIMEOUT) if session.gateway else TIMEOUT
+
+
+def _note_gateway_failure(country, reason):
+    now = time.monotonic()
+    with _gateway_lock:
+        recent = [t for t in _gateway_failures.get(country, ()) if now - t < config.STEPSTONE_GATEWAY_WINDOW] + [now]
+        _gateway_failures[country] = recent
+        if len(recent) >= int(config.STEPSTONE_GATEWAY_FAILURES):
+            _gateway_failures[country] = []
+            _gateway_paused[country] = now + config.STEPSTONE_GATEWAY_PAUSE
+            print(f"stepstone {country}: {len(recent)} failures on the gateway exit within "
+                  f"{config.STEPSTONE_GATEWAY_WINDOW} s (last: {reason}); residential exits only for "
+                  f"{config.STEPSTONE_GATEWAY_PAUSE} s")
+
+
+def _with_sessions(country, curl_call, browser_call, label, gateway=None):
     """Run curl_call(session) on pooled sessions of `country` (fresh ones after
-    a failure), then browser_call() when every attempt was refused."""
+    a failure) — on the gateway exit `gateway` first (_gateway_for), then on
+    the country's residential exits — then browser_call() when every
+    residential attempt was refused."""
     last = None
     blocked_only = True
     attempts = max(1, int(config.STEPSTONE_MAX_ATTEMPTS))
-    for attempt in range(1, attempts + 1):
+    gateway_tries = max(0, int(config.STEPSTONE_GATEWAY_ATTEMPTS)) if gateway else 0
+    total = gateway_tries + attempts
+    for attempt in range(1, total + 1):
+        via = gateway if attempt <= gateway_tries else None
         session = None
         rate_limited = False
         try:
-            session = _checkout(country, fresh=attempt > 1)
+            # the first try of each tier takes a pooled session, a retry a fresh one
+            session = _checkout(country, fresh=attempt > 1 and attempt != gateway_tries + 1, gateway=via)
             out = curl_call(session)
             _checkin(session)
             return out
@@ -367,15 +380,17 @@ def _with_sessions(country, curl_call, browser_call, label):
                 _checkin(session)
             raise
         except StepstoneUpstreamError as e:
-            last, blocked_only = e, False
+            last, blocked_only = e, blocked_only and bool(via)
             if session is not None:
                 session.close()
         except Exception as e:
-            last, blocked_only = StepstoneUpstreamError(f"{label}: {type(e).__name__}: {e}"), False
+            last, blocked_only = StepstoneUpstreamError(f"{label}: {type(e).__name__}: {e}"), blocked_only and bool(via)
             if session is not None:
                 session.close()
-        print(f"stepstone: attempt {attempt}/{attempts} on {label} failed: {last}")
-        if attempt < attempts:
+        print(f"stepstone: attempt {attempt}/{total} on {label}{' through ' + via if via else ''} failed: {last}")
+        if via:
+            _note_gateway_failure(country, last)
+        if attempt < total:
             time.sleep(RATE_LIMIT_BACKOFF * attempt if rate_limited else 0.4 * attempt)
     if blocked_only and config.STEPSTONE_BROWSER_FALLBACK and browser_call is not None:
         print(f"stepstone: every curl attempt on {label} was refused; trying the browser")
@@ -398,7 +413,7 @@ def page(site, path, params=None, label=None):
     headers = {**PAGE_HEADERS, "accept-language": row["accept_language"]}
     country = row["proxy_country"]
     return _with_sessions(country, lambda s: _curl_get(s, url, headers, label),
-                          lambda: _browser.page(country, url, label), label)
+                          lambda: _box_page(country, url, label), label, gateway=_gateway_for(country, url))
 
 
 def get_json(site, path, params=None, label=None):
@@ -407,9 +422,11 @@ def get_json(site, path, params=None, label=None):
     url = _url(row, path, params)
     label = label or f"{row['host']}{path}"
     headers = {**JSON_HEADERS, "accept-language": row["accept_language"], "referer": S.link(row, "/")}
-    resp = _with_sessions(row["proxy_country"], lambda s: _curl_get(s, url, headers, label), None, label)
+    country = row["proxy_country"]
+    resp = _with_sessions(country, lambda s: _curl_get(s, url, headers, label), None, label,
+                          gateway=_gateway_for(country, url))
     try:
-        return json.loads(resp.text) if resp.text.strip() else None
+        return fastjson.loads(resp.text) if resp.text.strip() else None
     except ValueError:
         dump_debug("non_json", resp.text)
         raise StepstoneUpstreamError(f"non-JSON body on {label}")
@@ -424,19 +441,7 @@ MEMO_MAX = 256
 
 
 def memoized(key, fn, ttl=MEMO_TTL):
-    now = time.monotonic()
-    with _memo_lock:
-        hit = _memo.get(key)
-        if hit and now - hit[0] < ttl:
-            _memo.move_to_end(key)
-            return hit[1]
-    value = fn()
-    with _memo_lock:
-        _memo[key] = (now, value)
-        _memo.move_to_end(key)
-        while len(_memo) > MEMO_MAX:
-            _memo.popitem(last=False)
-    return value
+    return memo.memoized(_memo, _memo_lock, MEMO_MAX, key, fn, ttl)
 
 
 def site_id(site):
